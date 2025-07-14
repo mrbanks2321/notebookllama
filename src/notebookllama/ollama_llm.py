@@ -7,6 +7,16 @@ from llama_index.core.llms import ChatMessage, CompletionResponse, CompletionRes
 from pydantic import Field
 
 
+# Custom metadata class for LlamaIndex compatibility (since LLMMetadata is not available in this version)
+class OllamaLLMMetadata:
+    def __init__(self, model_name, is_chat_model, is_function_calling_model, context_window, num_output=256):
+        self.model_name = model_name
+        self.is_chat_model = is_chat_model
+        self.is_function_calling_model = is_function_calling_model
+        self.context_window = context_window
+        self.num_output = num_output  # Required by LlamaIndex prompt helpers
+
+
 class OllamaLLM(LLM):
     """Ollama LLM wrapper for LlamaIndex."""
     model: str = Field(default="gemma3:4b")
@@ -25,13 +35,17 @@ class OllamaLLM(LLM):
         super().__init__(model=model, base_url=base_url, temperature=temperature, max_tokens=max_tokens, **kwargs)
     
     @property
-    def metadata(self) -> Dict[str, Any]:
-        """Get LLM metadata."""
-        return {
-            "model_name": self.model,
-            "is_chat_model": True,
-            "is_function_calling_model": False,
-        }
+    def metadata(self):
+        # Using a custom metadata class because LLMMetadata is not available in this LlamaIndex version.
+        # This ensures compatibility with CitationQueryEngine and related components.
+        # num_output is required by LlamaIndex prompt helpers.
+        return OllamaLLMMetadata(
+            model_name=self.model,
+            is_chat_model=True,
+            is_function_calling_model=False,
+            context_window=2048,
+            num_output=256,
+        )
     
     def _format_messages_to_prompt(self, messages: List[ChatMessage]) -> str:
         """Convert chat messages to a single prompt string."""

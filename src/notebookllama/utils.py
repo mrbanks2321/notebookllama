@@ -9,18 +9,18 @@ from datetime import datetime
 from mrkdwn_analysis import MarkdownAnalyzer
 from mrkdwn_analysis.markdown_analyzer import InlineParser, MarkdownParser
 from pydantic import BaseModel, Field, model_validator
-from llama_index.core.llms import ChatMessage
+from llama_index.core.llms import ChatMessage, LLM
 from llama_cloud_services import LlamaExtract, LlamaParse
 from llama_cloud_services.extract import SourceText
-from llama_cloud.client import AsyncLlamaCloud
+from src.notebookllama.chroma_storage import ChromaStorage
+from src.notebookllama.ollama_embeddings import OllamaEmbedding
 from llama_index.core.query_engine import CitationQueryEngine
 from llama_index.core.base.response.schema import Response
-from llama_index.indices.managed.llama_cloud import LlamaCloudIndex
-from llama_index.llms.openai import OpenAIResponses
 from typing_extensions import override
 from typing import List, Tuple, Union, Optional, Dict, cast
 from typing_extensions import Self
 from pyvis.network import Network
+from src.notebookllama.ollama_llm import OllamaLLM
 
 load_dotenv()
 
@@ -114,30 +114,23 @@ class ClaimVerification(BaseModel):
         return self
 
 
-if (
-    os.getenv("LLAMACLOUD_API_KEY", None)
-    and os.getenv("EXTRACT_AGENT_ID", None)
-    and os.getenv("LLAMACLOUD_PIPELINE_ID", None)
-    and os.getenv("OPENAI_API_KEY", None)
-):
-    LLM = OpenAIResponses(model="gpt-4.1", api_key=os.getenv("OPENAI_API_KEY"))
-    CLIENT = AsyncLlamaCloud(token=os.getenv("LLAMACLOUD_API_KEY"))
-    EXTRACT_AGENT = LlamaExtract(api_key=os.getenv("LLAMACLOUD_API_KEY")).get_agent(
-        id=os.getenv("EXTRACT_AGENT_ID")
-    )
-    PARSER = LlamaParse(api_key=os.getenv("LLAMACLOUD_API_KEY"), result_type="markdown")
-    PIPELINE_ID = os.getenv("LLAMACLOUD_PIPELINE_ID")
-    RETR = LlamaCloudIndex(
-        api_key=os.getenv("LLAMACLOUD_API_KEY"), pipeline_id=PIPELINE_ID
-    ).as_retriever()
-    QE = CitationQueryEngine(
-        retriever=RETR,
-        llm=LLM,
-        citation_chunk_size=256,
-        citation_chunk_overlap=50,
-    )
-    LLM_STRUCT = LLM.as_structured_llm(MindMap)
-    LLM_VERIFIER = LLM.as_structured_llm(ClaimVerification)
+# Instantiate ChromaDB storage globally
+chroma_storage = ChromaStorage(
+    persist_directory="./chroma_db",
+    collection_name="notebookllama",
+    embedding_model=OllamaEmbedding(model="nomic-embed-text")
+)
+
+# Use ChromaDB retriever and query engine
+RETR = chroma_storage.get_retriever()
+QE = chroma_storage.get_query_engine()
+
+# Example: To add a document, use chroma_storage.add_text(text, metadata)
+# Example: To query, use QE.query(question) or await QE.aquery(question)
+
+llm_instance = OllamaLLM(model="gemma3:4b", temperature=0.1)
+LLM_STRUCT = llm_instance.as_structured_llm(MindMap)
+LLM_VERIFIER = llm_instance.as_structured_llm(ClaimVerification)
 
 
 def md_table_to_pd_dataframe(md_table: Dict[str, list]) -> Optional[pd.DataFrame]:
@@ -186,55 +179,41 @@ def rename_and_remove_current_images(images: List[str]) -> List[str]:
     return imgs
 
 
+# Update parse_file and process_file to use local parser and ChromaDB
+from src.notebookllama.local_parsers import LocalParser
+
+local_parser = LocalParser()
+
 async def parse_file(
     file_path: str, with_images: bool = False, with_tables: bool = False
 ) -> Union[Tuple[Optional[str], Optional[List[str]], Optional[List[pd.DataFrame]]]]:
+    print(f"[parse_file] Start: file_path={file_path}")
     images: Optional[List[str]] = None
     text: Optional[str] = None
     tables: Optional[List[pd.DataFrame]] = None
-    document = await PARSER.aparse(file_path=file_path)
-    md_content = await document.aget_markdown_documents()
-    if len(md_content) != 0:
-        text = "\n\n---\n\n".join([doc.text for doc in md_content])
-    if with_images:
-        rename_and_remove_past_images()
-        imgs = await document.asave_all_images("static/")
-        images = rename_and_remove_current_images(imgs)
-    if with_tables:
-        if text is not None:
-            analyzer = MarkdownTextAnalyzer(text)
-            md_tables = analyzer.identify_tables()["Table"]
-            tables = []
-            for md_table in md_tables:
-                table = md_table_to_pd_dataframe(md_table=md_table)
-                if table is not None:
-                    tables.append(table)
-                    os.makedirs("data/extracted_tables/", exist_ok=True)
-                    table.to_csv(
-                        f"data/extracted_tables/table_{datetime.now().strftime('%Y_%d_%m_%H_%M_%S_%f')[:-3]}.csv",
-                        index=False,
-                    )
+    print("[parse_file] Before await local_parser.aparse")
+    document = await local_parser.aparse(file_path=file_path)
+    print("[parse_file] After await local_parser.aparse")
+    text = document.text
+    # (Images and tables logic can be added later if needed)
+    print("[parse_file] Returning text, images, tables")
     return text, images, tables
-
 
 async def process_file(
     filename: str,
 ) -> Union[Tuple[str, None], Tuple[None, None], Tuple[str, str]]:
-    with open(filename, "rb") as f:
-        file = await CLIENT.files.upload_file(upload_file=f)
-    files = [{"file_id": file.id}]
-    await CLIENT.pipelines.add_files_to_pipeline_api(
-        pipeline_id=PIPELINE_ID, request=files
-    )
+    print(f"[process_file] Start: filename={filename}")
     text, _, _ = await parse_file(file_path=filename)
-    if text is None:
+    print(f"[process_file] After parse_file: text is {'not None' if text is not None else 'None'}")
+    if not text or not text.strip():
+        print("[process_file] Skipping add_text: text is empty")
         return None, None
-    extraction_output = await EXTRACT_AGENT.aextract(
-        files=SourceText(text_content=text, filename=file.name)
-    )
-    if extraction_output:
-        return json.dumps(extraction_output.data, indent=4), text
-    return None, None
+    # Add text to ChromaDB
+    print("[process_file] Before chroma_storage.add_text")
+    chroma_storage.add_text(text, metadata={"filename": filename})
+    print("[process_file] After chroma_storage.add_text")
+    print("[process_file] Returning (text, text)")
+    return text, text
 
 
 async def get_mind_map(summary: str, highlights: List[str]) -> Union[str, None]:
